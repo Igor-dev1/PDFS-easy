@@ -1,6 +1,6 @@
 # PDFS-easy (Streamlit)
 
-Interface web para gerar múltiplas cópias de um PDF preenchendo automaticamente campos de login e senha.
+Interface web para gerar múltiplas cópias de um PDF editando diretamente os textos de login e senha.
 
 ## Como executar localmente
 
@@ -13,7 +13,7 @@ streamlit run PDFS-easy/app.py
 
 1. Faça upload do PDF modelo original.
 2. Envie um arquivo CSV UTF-8 com cabeçalho `output_name,login,password`.
-3. Ajuste coordenadas, fonte, tamanho e retângulo de limpeza no painel lateral conforme necessário.
+3. Defina a página que contém os campos e escolha se deseja manter os logins/senhas originais ou aplicar novos valores.
 4. Clique em **Gerar PDFs** para baixar um arquivo único ou um ZIP com todas as cópias personalizadas.
 
-Os parâmetros correspondem aos mesmos utilizados no script de linha de comando `bulk_pdf_credentials.py`, mantendo o comportamento consistente entre CLI e interface web.
+Quando a opção *Manter login/senha* estiver desativada, os textos são substituídos nativamente, preservando o layout original sem sobreposições. Caso contrário, apenas o nome de saída é alterado.

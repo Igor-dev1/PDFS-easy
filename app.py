@@ -1,5 +1,5 @@
 """
-Interface Streamlit para gerar PDFs com logins e senhas personalizados.
+Interface Streamlit para gerar PDFs com logins e senhas editadas diretamente no conteúdo.
 
 Execute localmente com:
     streamlit run PDFS-easy/app.py
@@ -9,20 +9,25 @@ from __future__ import annotations
 
 import csv
 import io
+import re
 import zipfile
 from dataclasses import dataclass
 from typing import Iterable, List, Tuple
 
 import streamlit as st
 from pypdf import PdfReader, PdfWriter
-from pypdf._page import PageObject
-from reportlab.lib.colors import black, white
-from reportlab.pdfgen import canvas
+from pypdf.generic import (
+    ArrayObject,
+    DecodedStreamObject,
+    DictionaryObject,
+    IndirectObject,
+    NameObject,
+)
 
-
-DEFAULT_LOGIN_POS = (170.0, 510.0)
-DEFAULT_PASSWORD_POS = (440.0, 510.0)
-DEFAULT_ERASE_BOX = (150.0, 495.0, 260.0, 45.0)
+PLACEHOLDER_PATTERN = re.compile(
+    rb"/C2_0 19\.2 Tf\s+0\.6375 0 0 0\.6375 157\.2973 535\.605 Tm\s*\[[^\]]+\]TJ\s*372\.799 0 Td\s*\[[^\]]+\]TJ",
+    re.S,
+)
 
 
 @dataclass
@@ -32,16 +37,10 @@ class CredentialRow:
     password: str
 
 
-@dataclass
-class OverlayOptions:
-    login_pos: Tuple[float, float]
-    password_pos: Tuple[float, float]
-    font_name: str
-    font_size: float
-    erase_box: Tuple[float, float, float, float] | None
-
-
-def load_rows_from_csv(file_buffer: io.BytesIO) -> List[CredentialRow]:
+def load_rows_from_csv(
+    file_buffer: io.BytesIO,
+    allow_empty_credentials: bool = False,
+) -> List[CredentialRow]:
     text_wrapper = io.TextIOWrapper(file_buffer, encoding="utf-8-sig")
     reader = csv.DictReader(text_wrapper)
     required = {"output_name", "login", "password"}
@@ -50,59 +49,93 @@ def load_rows_from_csv(file_buffer: io.BytesIO) -> List[CredentialRow]:
             f"CSV precisa conter as colunas: {', '.join(sorted(required))}. "
             f"Encontrado: {reader.fieldnames!r}"
         )
+
     rows: List[CredentialRow] = []
     for idx, record in enumerate(reader, start=2):
         output = (record.get("output_name") or "").strip()
         login = (record.get("login") or "").strip()
         password = (record.get("password") or "").strip()
-        if not output or not login or not password:
-            raise ValueError(
-                f"Linha {idx}: campos vazios (output_name='{output}', "
-                f"login='{login}', password='{password}')"
-            )
+        if not output:
+            raise ValueError(f"Linha {idx}: output_name vazio.")
+        if not allow_empty_credentials and (not login or not password):
+            raise ValueError(f"Linha {idx}: login/senha vazios.")
         rows.append(CredentialRow(output, login, password))
+
     if not rows:
         raise ValueError("CSV não possui registros válidos.")
     return rows
 
 
-def build_overlay(
-    page_width: float,
-    page_height: float,
-    credential: CredentialRow,
-    opts: OverlayOptions,
-) -> PageObject:
-    buffer = io.BytesIO()
-    canv = canvas.Canvas(buffer, pagesize=(page_width, page_height))
-    if opts.erase_box and opts.erase_box[0] >= 0:
-        x, y, w, h = opts.erase_box
-        canv.setFillColor(white)
-        canv.rect(x, y, w, h, stroke=0, fill=1)
-    canv.setFillColor(black)
-    canv.setFont(opts.font_name, opts.font_size)
-    canv.drawString(opts.login_pos[0], opts.login_pos[1], credential.login)
-    canv.drawString(opts.password_pos[0], opts.password_pos[1], credential.password)
-    canv.save()
-    buffer.seek(0)
-    overlay_reader = PdfReader(buffer)
-    return overlay_reader.pages[0]
+def escape_pdf(text: str) -> str:
+    return text.replace("\\", "\\\\").replace("(", "\\(").replace(")", "\\)")
 
 
-def merge_pages(base_page: PageObject, overlay: PageObject) -> PageObject:
-    merged = PageObject.create_blank_page(
-        width=float(base_page.mediabox.width),
-        height=float(base_page.mediabox.height),
+def ensure_font(page, writer: PdfWriter, font_name: str = "/FSP") -> None:
+    resources = page.get("/Resources")
+    if isinstance(resources, IndirectObject):
+        resources = resources.get_object()
+    if resources is None:
+        resources = DictionaryObject()
+        page[NameObject("/Resources")] = resources
+
+    fonts = resources.get("/Font")
+    if fonts is None:
+        fonts = DictionaryObject()
+        resources[NameObject("/Font")] = fonts
+    elif isinstance(fonts, IndirectObject):
+        fonts = fonts.get_object()
+        resources[NameObject("/Font")] = fonts
+
+    if NameObject(font_name) in fonts:
+        return
+
+    font_dict = DictionaryObject(
+        {
+            NameObject("/Type"): NameObject("/Font"),
+            NameObject("/Subtype"): NameObject("/Type1"),
+            NameObject("/BaseFont"): NameObject("/Helvetica"),
+            NameObject("/Encoding"): NameObject("/WinAnsiEncoding"),
+        }
     )
-    merged.merge_page(base_page)
-    merged.merge_page(overlay)
-    return merged
+    font_ref = writer._add_object(font_dict)
+    fonts[NameObject(font_name)] = font_ref
+
+
+def update_page_text(page, writer: PdfWriter, login: str, password: str) -> None:
+    ensure_font(page, writer)
+
+    contents = page.get("/Contents")
+    if contents is None:
+        raise RuntimeError("Página não possui conteúdo.")
+
+    if isinstance(contents, ArrayObject):
+        data = b"".join(obj.get_object().get_data() for obj in contents)
+    else:
+        data = contents.get_object().get_data()
+
+    replacement = (
+        "/FSP 19.2 Tf\n"
+        "0.6375 0 0 0.6375 157.2973 535.605 Tm\n"
+        f"({escape_pdf(login)}) Tj\n"
+        "372.799 0 Td\n"
+        f"({escape_pdf(password)}) Tj"
+    ).encode("latin1")
+
+    new_data, count = PLACEHOLDER_PATTERN.subn(replacement, data)
+    if count == 0:
+        raise RuntimeError("Não foi possível localizar o bloco de login/senha no PDF.")
+
+    stream = DecodedStreamObject()
+    stream.set_data(new_data)
+    encoded = stream.flate_encode()
+    page[NameObject("/Contents")] = writer._add_object(encoded)
 
 
 def generate_pdfs(
     template_bytes: bytes,
     rows: Iterable[CredentialRow],
     page_index: int,
-    opts: OverlayOptions,
+    keep_credentials: bool,
 ) -> List[Tuple[str, bytes]]:
     reader = PdfReader(io.BytesIO(template_bytes))
     if page_index < 0 or page_index >= len(reader.pages):
@@ -110,25 +143,18 @@ def generate_pdfs(
             f"Página {page_index} inválida. O PDF possui {len(reader.pages)} página(s)."
         )
     template_pages = reader.pages
-    page_width = float(template_pages[page_index].mediabox.width)
-    page_height = float(template_pages[page_index].mediabox.height)
 
     outputs: List[Tuple[str, bytes]] = []
     for cred in rows:
-        overlay_page = build_overlay(page_width, page_height, cred, opts)
         writer = PdfWriter()
         for idx, src_page in enumerate(template_pages):
-            page_copy = PageObject.create_blank_page(
-                width=float(src_page.mediabox.width),
-                height=float(src_page.mediabox.height),
-            )
-            page_copy.merge_page(src_page)
-            if idx == page_index:
-                page_copy = merge_pages(page_copy, overlay_page)
+            page_copy = src_page.copy()
+            if idx == page_index and not keep_credentials:
+                update_page_text(page_copy, writer, cred.login, cred.password)
             writer.add_page(page_copy)
-        output_buffer = io.BytesIO()
-        writer.write(output_buffer)
-        outputs.append((cred.output_name, output_buffer.getvalue()))
+        buffer = io.BytesIO()
+        writer.write(buffer)
+        outputs.append((cred.output_name, buffer.getvalue()))
     return outputs
 
 
@@ -140,8 +166,8 @@ def main() -> None:
         """
         1. Envie o PDF modelo.
         2. Envie um CSV com as colunas `output_name, login, password`.
-        3. Ajuste posicionamento, fonte e tamanho se necessário.
-        4. Clique em **Gerar PDFs** e baixe o pacote ZIP resultante.
+        3. Escolha se deseja manter os logins/senhas originais ou aplicar novos valores.
+        4. Clique em **Gerar PDFs** e faça o download.
         """
     )
 
@@ -150,31 +176,11 @@ def main() -> None:
         page_index = st.number_input(
             "Página alvo (índice começando em 0)", min_value=0, value=0, step=1
         )
-        login_x = st.number_input("Login X", value=DEFAULT_LOGIN_POS[0], step=1.0)
-        login_y = st.number_input("Login Y", value=DEFAULT_LOGIN_POS[1], step=1.0)
-        password_x = st.number_input("Senha X", value=DEFAULT_PASSWORD_POS[0], step=1.0)
-        password_y = st.number_input("Senha Y", value=DEFAULT_PASSWORD_POS[1], step=1.0)
-        font_name = st.selectbox(
-            "Fonte",
-            options=[
-                "Helvetica",
-                "Helvetica-Bold",
-                "Helvetica-Oblique",
-                "Times-Roman",
-                "Times-Bold",
-                "Courier",
-            ],
-            index=1,
+        keep_credentials = st.checkbox(
+            "Manter login/senha originais do PDF",
+            value=False,
+            help="Ative para gerar cópias apenas com nomes diferentes.",
         )
-        font_size = st.number_input("Tamanho da fonte", value=18.0, step=1.0)
-        erase_enabled = st.checkbox("Limpar área antiga com retângulo branco", value=True)
-        erase_box = DEFAULT_ERASE_BOX if erase_enabled else None
-        if erase_enabled:
-            erase_x = st.number_input("Caixa X", value=DEFAULT_ERASE_BOX[0], step=1.0)
-            erase_y = st.number_input("Caixa Y", value=DEFAULT_ERASE_BOX[1], step=1.0)
-            erase_w = st.number_input("Caixa largura", value=DEFAULT_ERASE_BOX[2], step=1.0)
-            erase_h = st.number_input("Caixa altura", value=DEFAULT_ERASE_BOX[3], step=1.0)
-            erase_box = (erase_x, erase_y, erase_w, erase_h)
 
     uploaded_pdf = st.file_uploader("PDF modelo", type=["pdf"])
     uploaded_csv = st.file_uploader("Credenciais (CSV)", type=["csv"])
@@ -183,7 +189,10 @@ def main() -> None:
     if uploaded_csv is not None:
         try:
             csv_bytes = io.BytesIO(uploaded_csv.getvalue())
-            rows_preview = load_rows_from_csv(csv_bytes)
+            rows_preview = load_rows_from_csv(
+                csv_bytes,
+                allow_empty_credentials=keep_credentials,
+            )
             st.success(f"{len(rows_preview)} registros carregados do CSV.")
             st.dataframe(
                 {
@@ -195,14 +204,6 @@ def main() -> None:
         except Exception as exc:  # noqa: BLE001
             st.error(f"Erro ao ler CSV: {exc}")
 
-    options = OverlayOptions(
-        login_pos=(login_x, login_y),
-        password_pos=(password_x, password_y),
-        font_name=font_name,
-        font_size=font_size,
-        erase_box=erase_box,
-    )
-
     if st.button("Gerar PDFs", type="primary"):
         if uploaded_pdf is None:
             st.error("Envie o PDF modelo antes de gerar.")
@@ -211,12 +212,18 @@ def main() -> None:
             st.error("CSV inválido ou não carregado.")
             return
 
+        if not keep_credentials:
+            for row in rows_preview:
+                if not row.login or not row.password:
+                    st.error("Login/senha vazios não são permitidos quando a opção está desativada.")
+                    return
+
         try:
             outputs = generate_pdfs(
                 template_bytes=uploaded_pdf.getvalue(),
                 rows=rows_preview,
                 page_index=int(page_index),
-                opts=options,
+                keep_credentials=keep_credentials,
             )
         except Exception as exc:  # noqa: BLE001
             st.error(f"Erro durante a geração: {exc}")
