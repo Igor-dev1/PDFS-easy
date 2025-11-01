@@ -148,10 +148,13 @@ def generate_pdfs(
     for cred in rows:
         writer = PdfWriter()
         for idx, src_page in enumerate(template_pages):
-            page_copy = src_page.copy()
-            if idx == page_index and not keep_credentials:
-                update_page_text(page_copy, writer, cred.login, cred.password)
-            writer.add_page(page_copy)
+            writer.add_page(src_page)
+            page_ref = writer.pages[-1]
+            if idx == page_index:
+                if keep_credentials:
+                    ensure_font(page_ref, writer)
+                else:
+                    update_page_text(page_ref, writer, cred.login, cred.password)
         buffer = io.BytesIO()
         writer.write(buffer)
         outputs.append((cred.output_name, buffer.getvalue()))
