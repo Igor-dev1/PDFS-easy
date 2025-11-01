@@ -24,8 +24,13 @@ from pypdf.generic import (
     NameObject,
 )
 
-PLACEHOLDER_PATTERN = re.compile(
-    rb"/C2_0 19\.2 Tf\s+0\.6375 0 0 0\.6375 157\.2973 535\.605 Tm\s*\[[^\]]+\]TJ\s*372\.799 0 Td\s*\[[^\]]+\]TJ",
+LOGIN_PATTERN = re.compile(
+    rb"BT\s*/C2_1 11\.22 Tf\s+123\.222 497\.355 Td\s*<[^>]+>Tj\s*/C2_2 11\.22 Tf\s+28\.055 0 Td\s*<[^>]+>Tj\s*ET",
+    re.S,
+)
+
+PASSWORD_PATTERN = re.compile(
+    rb"BT\s*/C2_1 11\.22 Tf\s+345\.005 497\.356 Td\s*<[^>]+>Tj\s*ET",
     re.S,
 )
 
@@ -113,17 +118,28 @@ def update_page_text(page, writer: PdfWriter, login: str, password: str) -> None
     else:
         data = contents.get_object().get_data()
 
-    replacement = (
-        "/FSP 19.2 Tf\n"
-        "0.6375 0 0 0.6375 157.2973 535.605 Tm\n"
+    login_replacement = (
+        "BT\n"
+        "1 1 1 rg\n"
+        "/FSP 11.22 Tf\n"
+        "123.222 497.355 Td\n"
         f"({escape_pdf(login)}) Tj\n"
-        "372.799 0 Td\n"
-        f"({escape_pdf(password)}) Tj"
+        "ET"
     ).encode("latin1")
 
-    new_data, count = PLACEHOLDER_PATTERN.subn(replacement, data)
-    if count == 0:
-        raise RuntimeError("Não foi possível localizar o bloco de login/senha no PDF.")
+    password_replacement = (
+        "BT\n"
+        "1 1 1 rg\n"
+        "/FSP 11.22 Tf\n"
+        "345.005 497.356 Td\n"
+        f"({escape_pdf(password)}) Tj\n"
+        "ET"
+    ).encode("latin1")
+
+    new_data, login_count = LOGIN_PATTERN.subn(login_replacement, data, count=1)
+    new_data, password_count = PASSWORD_PATTERN.subn(password_replacement, new_data, count=1)
+    if login_count == 0 or password_count == 0:
+        raise RuntimeError("Não foi possível localizar os campos de login/senha no PDF.")
 
     stream = DecodedStreamObject()
     stream.set_data(new_data)
